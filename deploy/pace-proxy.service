@@ -1,0 +1,23 @@
+[Unit]
+Description=pace-proxy — out-of-process pacing proxy for [OI]-compatible upstreams
+Documentation=https://github.com/ruralTom/pace-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/pace-proxy
+EnvironmentFile=%h/pace-proxy/.env
+ExecStart=%h/pace-proxy/.venv/bin/python -m uvicorn pace_proxy:app --host 127.0.0.1 --port 8899 --no-access-log
+Restart=on-failure
+RestartSec=3
+
+# The proxy holds an API key: keep it to its own user and its own socket.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/pace-proxy
+
+[Install]
+WantedBy=default.target

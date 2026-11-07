@@ -1,0 +1,15 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# --- Secrets: this proxy holds an API key ---
+.env
+*.key
+token
+
+# --- Local state ---
+*.log
