@@ -136,16 +136,35 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.in_flight = max(0, STATE.in_flight - 1)
 
 
-def wait_for(url: str, timeout: float = 20.0) -> None:
+def wait_for(url: str, proc=None, timeout: float = 20.0) -> None:
+    """Wait for the health endpoint, but fail with the child's output if it dies.
+
+    A bare "never became ready" hides the actual cause — usually a missing
+    dependency or a bad env var. Surface the subprocess log instead.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            out = ""
+            if proc.stdout is not None:
+                try:
+                    out = proc.stdout.read()
+                except Exception:
+                    out = ""
+            raise RuntimeError(
+                f"proxy exited with code {proc.returncode} before becoming ready.\n"
+                f"--- proxy output ---\n{out.strip() or '(no output)'}\n"
+                f"--- hint ---\n"
+                f"If this says 'No module named uvicorn', install the runtime "
+                f"requirements: ./.venv/bin/pip install -r requirements.txt"
+            )
         try:
             with urllib.request.urlopen(url, timeout=1) as r:
                 if r.status == 200:
                     return
         except Exception:
             time.sleep(0.15)
-    raise RuntimeError(f"{url} never became ready")
+    raise RuntimeError(f"{url} never became ready within {timeout:.0f}s")
 
 
 def post(base: str, path: str, body: dict, timeout: float = 60.0, stream: bool = False):
@@ -196,7 +215,7 @@ def main() -> int:
 
     base = f"http://127.0.0.1:{shim_port}"
     try:
-        wait_for(f"{base}/healthz")
+        wait_for(f"{base}/healthz", proc=proc)
         print("\n1. Sequential calls with no human-sized gap")
         codes = [post(base, "/v1/responses", {"model": GOOD_MODEL, "input": "hi"})[0]
                  for _ in range(3)]
