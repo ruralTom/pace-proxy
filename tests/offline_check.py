@@ -49,7 +49,7 @@ def free_port() -> int:
 class UpstreamState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.last_request = 0.0
+        self.last_finished = 0.0
         self.in_flight = 0
         self.peak_in_flight = 0
         self.total = 0
@@ -84,8 +84,11 @@ class Handler(BaseHTTPRequestHandler):
             now = time.monotonic()
             STATE.total += 1
             STATE.models.append(model)
-            too_fast = (now - STATE.last_request) < UPSTREAM_GAP
-            STATE.last_request = now
+            # Enforce the gap the way a real provider does: from when the
+            # previous response FINISHED, not when the previous request arrived.
+            # Measuring start-to-start here makes the harness easier to pass
+            # than the real service, which hides exactly the bug it should catch.
+            too_fast = (now - STATE.last_finished) < UPSTREAM_GAP
             at_capacity = STATE.in_flight >= UPSTREAM_MAX_CONCURRENT
             if not too_fast and not at_capacity:
                 STATE.in_flight += 1
@@ -133,6 +136,9 @@ class Handler(BaseHTTPRequestHandler):
             })
         finally:
             with STATE.lock:
+                # Stamp on completion: the cooldown starts when this response
+                # finished, which is what the real provider enforces.
+                STATE.last_finished = time.monotonic()
                 STATE.in_flight = max(0, STATE.in_flight - 1)
 
 

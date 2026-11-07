@@ -63,18 +63,26 @@ UPSTREAM = os.environ.get("PACE_UPSTREAM", "https://api.openai.com/v1").rstrip("
 API_KEY = os.environ.get("PACE_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
 
 # --- Pacing ---------------------------------------------------------------
-# Gap between requests that share the throttled (usually free) tier. Measure
-# your own provider's cliff: send N calls at each candidate gap and find the
-# smallest value with zero rejections, then add margin. Guessing wastes
-# throughput; guessing low wastes requests.
-MIN_GAP = float(os.environ.get("PACE_FREE_GAP", "2.8"))
+# IDLE gap between requests on the throttled (usually free) tier: measured from
+# the previous response FINISHING to the next request being sent, which is what
+# providers actually enforce. The pacer stamps its clock on release for exactly
+# this reason — stamping at request start subtracts the provider's own latency
+# and silently delivers a fraction of the gap you configured.
+#
+# Measure your own cliff with scripts/probe_gap.py and set this above the first
+# unambiguously clean value. A noisy band where identical gaps alternate
+# pass/fail means a token bucket refilling, not a broken test.
+MIN_GAP = float(os.environ.get("PACE_FREE_GAP", "2.5"))
 # Metered/premium tiers usually have no cooldown. Pacing them at the free gap
 # is pure added latency for zero protection.
 PAID_MIN_GAP = float(os.environ.get("PACE_PAID_GAP", "0"))
 # Provider concurrency cap, minus headroom for callers you don't control.
 MAX_CONCURRENT = int(os.environ.get("PACE_MAX_CONCURRENT", "4"))
 # How many times to wait out a cooldown rejection before giving up on a model.
-COOLDOWN_RETRIES = int(os.environ.get("PACE_COOLDOWN_RETRIES", "2"))
+# Keep this low: each retry is a billed upstream call, and the pacer already
+# spaced the requests correctly, so a cooldown after correct pacing usually
+# means the whole tier is throttled rather than that a race was lost.
+COOLDOWN_RETRIES = int(os.environ.get("PACE_COOLDOWN_RETRIES", "1"))
 # Extra wait added after a cooldown rejection so we clear the window with margin.
 COOLDOWN_MARGIN = float(os.environ.get("PACE_COOLDOWN_MARGIN", "1.0"))
 
@@ -97,6 +105,14 @@ EXHAUSTED_MARKERS = _env_list(
     "PACE_EXHAUSTED_MARKERS",
     "daily limit reached,no permanent credit,insufficient quota,out of credits",
 )
+# The account's quota for the tier is spent — an HOURLY cap, not a short
+# cooldown. Retrying cannot help; only the window rolling over can. Checked
+# BEFORE the cooldown markers, because an hourly rejection usually also contains
+# the words "rate limit" and would otherwise be retried pointlessly.
+BUDGET_MARKERS = _env_list(
+    "PACE_BUDGET_MARKERS",
+    "hourly rate limit,hourly limit,requests per hour",
+)
 # Substring that marks a model as metered/premium (no cooldown applies).
 PAID_MARKER = os.environ.get("PACE_PAID_MARKER", ":metered")
 
@@ -112,21 +128,29 @@ FORCED_UA = os.environ.get("PACE_USER_AGENT", DEFAULT_UA)
 
 
 class Pacer:
-    """One global clock, with a per-tier gap.
+    """A per-tier minimum-idle gate.
 
-    Throttled tiers carry an account-wide cooldown; metered tiers usually do
-    not. The gap is therefore chosen per request, and the clocks are kept
-    separate so a metered call is never delayed by a free call's window and
-    vice versa.
+    Providers that enforce "N seconds between messages" measure the idle time
+    from when the previous response FINISHED. Two consequences drive this class:
+
+    * The clock must be stamped on release, not on acquire. Stamping at acquire
+      subtracts the provider's own latency and silently delivers a fraction of
+      the configured gap.
+    * A tier with a gap cannot serve concurrent requests. A second request
+      admitted while the first is still in flight collapses the idle window to
+      zero no matter how the clock is stamped. So the free tier serializes: one
+      request at a time, each waiting out the gap from the previous completion.
+
+    Metered tiers typically have gap 0 and no cooldown, so they keep the full
+    concurrency allowance and are never delayed behind a free request's window.
     """
 
     def __init__(self, free_gap: float, paid_gap: float, max_concurrent: int) -> None:
         self.free_gap = free_gap
         self.paid_gap = paid_gap
-        self._lock = asyncio.Lock()
+        self._free_lock = asyncio.Lock()   # serializes the paced tier
+        self._paid_sem = asyncio.Semaphore(max_concurrent)
         self._last_free: float = 0.0
-        self._last_paid: float = 0.0
-        self._sem = asyncio.Semaphore(max_concurrent)
         self.in_flight = 0
         self.total = 0
         self.paces = 0
@@ -136,53 +160,55 @@ class Pacer:
         return bool(PAID_MARKER) and PAID_MARKER in model
 
     async def acquire(self, model: str = "") -> None:
-        await self._sem.acquire()
         paid = self.is_paid(model)
-        gap = self.paid_gap if paid else self.free_gap
-        async with self._lock:
-            last = self._last_paid if paid else self._last_free
-            if gap > 0:
-                now = time.monotonic()
-                wait = (last + gap) - now
+        if paid:
+            # Unmetered tier: concurrency allowed, no idle window.
+            await self._paid_sem.acquire()
+        else:
+            # Paced tier: hold the lock for the whole request so the next caller
+            # cannot start until this one has finished and waited out the gap.
+            await self._free_lock.acquire()
+            if self.free_gap > 0:
+                wait = (self._last_free + self.free_gap) - time.monotonic()
                 if wait > 0:
                     self.paces += 1
                     await asyncio.sleep(wait)
-            stamp = time.monotonic()
-            if paid:
-                self._last_paid = stamp
-            else:
-                self._last_free = stamp
         self.in_flight += 1
         self.total += 1
 
-    def release(self) -> None:
-        self.in_flight = max(0, self.in_flight - 1)
-        self._sem.release()
+    def release(self, model: str = "") -> None:
+        """Release the tier and stamp completion — the idle window starts here."""
+        if self.is_paid(model):
+            self.in_flight = max(0, self.in_flight - 1)
+            self._paid_sem.release()
+        else:
+            self._last_free = time.monotonic()
+            self.in_flight = max(0, self.in_flight - 1)
+            self._free_lock.release()
 
     async def penalty(self, seconds: float, model: str = "") -> None:
-        """Push the relevant clock forward after an upstream cooldown rejection."""
-        async with self._lock:
-            gap = self.paid_gap if self.is_paid(model) else self.free_gap
-            target = time.monotonic() + seconds - gap
-            if self.is_paid(model):
-                self._last_paid = max(self._last_paid, target)
-            else:
-                self._last_free = max(self._last_free, target)
+        """Push the paced clock forward after an upstream cooldown rejection."""
+        self._last_free = max(self._last_free, time.monotonic() + seconds - self.free_gap)
 
 
 PACER = Pacer(MIN_GAP, PAID_MIN_GAP, MAX_CONCURRENT)
 
 
 def _classify(status: int, body: bytes) -> str:
-    """Return ok | cooldown | exhausted | hard.
+    """Return ok | budget | cooldown | exhausted | hard.
 
-    Status code alone is not enough: providers reuse 403 and 400 for
-    throttling, and SDKs treat those as permanent. The body says what actually
-    happened.
+    Status code alone is not enough: providers reuse 403 and 400 for throttling,
+    and SDKs treat those as permanent. The body says what actually happened.
+
+    Order matters. An hourly-cap rejection usually also contains the words
+    "rate limit", so the budget check must run first or it gets retried as a
+    short cooldown the budget cannot afford.
     """
     text = body.decode("utf-8", "replace").lower()
     if 200 <= status < 300:
         return "ok"
+    if any(m in text for m in BUDGET_MARKERS):
+        return "budget"
     if any(m in text for m in COOLDOWN_MARKERS):
         return "cooldown"
     if any(m in text for m in EXHAUSTED_MARKERS):
@@ -243,7 +269,7 @@ async def _handle(request: Request, path: str) -> Response:
                 nonlocal released
                 if not released:
                     released = True
-                    PACER.release()
+                    PACER.release(model)
 
             try:
                 resp = await _proxy(
@@ -266,6 +292,18 @@ async def _handle(request: Request, path: str) -> Response:
                 kind = _classify(resp.status_code, raw)
                 last_error = (resp.status_code, raw)
 
+                # Budget exhausted: the tier's hourly quota is gone. No retry and
+                # no ladder walk — every model on the tier shares the pool. Emit
+                # 429 so the caller backs off instead of re-authenticating.
+                if kind == "budget":
+                    LOG.warning("budget exhausted on %s — emitting 429, no retry, "
+                                "no ladder walk (quota problem, not auth)", model)
+                    return Response(
+                        content=raw, status_code=429,
+                        media_type=resp.headers.get("content-type", "application/json"),
+                        headers={"retry-after": "300"},
+                    )
+
                 if kind == "cooldown" and cooldown_attempts < COOLDOWN_RETRIES:
                     cooldown_attempts += 1
                     await PACER.penalty(
@@ -280,8 +318,17 @@ async def _handle(request: Request, path: str) -> Response:
                                 resp.status_code, model)
                     return Response(content=raw, status_code=resp.status_code,
                                     media_type=resp.headers.get("content-type", "application/json"))
+                if kind == "cooldown":
+                    # A throttle is not an auth failure. Passing the upstream's
+                    # 403 through makes every SDK tell the user to re-enter an API
+                    # key that was never the problem.
+                    LOG.warning("cooldown on %s — tier is throttled account-wide, not "
+                                "walking the ladder; emitting 429", model)
+                    return Response(content=raw, status_code=429,
+                                    media_type=resp.headers.get("content-type", "application/json"),
+                                    headers={"retry-after": "10"})
                 LOG.info("moving down ladder past %s (%s)", model, kind)
-                break             # exhausted, or cooldown retries spent -> next model
+                break             # exhausted (model-specific) -> next model
 
             if stream:
                 LOG.info("streaming %s via %s", path, model)
@@ -399,4 +446,4 @@ async def models(request: Request):
         return Response(content=raw, status_code=resp.status_code,
                         media_type=resp.headers.get("content-type", "application/json"))
     finally:
-        PACER.release()
+        PACER.release(f"catalog{PAID_MARKER}")

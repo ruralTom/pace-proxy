@@ -5,9 +5,9 @@ A small, single-file proxy that paces requests to an [OI]-compatible API from
 
 ```
 your client ──▶ pace-proxy :8899 ──▶ upstream provider
-                 one clock
+                 one idle window
                  one ladder
-                 one concurrency cap
+                 one honest status code
 ```
 
 ~400 lines. FastAPI + httpx. No API key needed to test it.
@@ -34,8 +34,10 @@ cooldown and is rejected. Unpaced, a fallback chain makes things worse.
 
 ## What it does
 
-- **One global clock**, with a separate gap per tier — throttled models get the
-  cooldown, metered models get zero added latency.
+- **One idle window per tier**, measured from when the previous response
+  *finished* — throttled models get the gap, metered models get zero added
+  latency. A paced tier serializes; it cannot serve two requests at once without
+  collapsing the idle window to zero.
 - **Concurrency cap**, held for the whole response including streamed bodies.
 - **Ladder fallback** — an exhausted model moves you to the next one instead of
   failing the request.
@@ -84,7 +86,7 @@ curl -s localhost:8899/healthz | python3 -m json.tool
 {
   "ok": true,
   "upstream": "https://api.example.com/v1",
-  "free_gap_seconds": 2.8,
+  "free_gap_seconds": 2.5,
   "paid_gap_seconds": 0.0,
   "max_concurrent": 4,
   "in_flight": 0,
@@ -132,6 +134,57 @@ against it, and asserts each promise:
 
 In that run the upstream rejected **zero** of 23 requests. That's the whole
 claim: the proxy stayed inside the window instead of finding out the hard way.
+
+## The bug worth knowing about (2): the gap was measured from the wrong end
+
+If you pace requests, you will very likely write this:
+
+```python
+async def acquire(self):
+    wait = (self._last + self.gap) - time.monotonic()
+    if wait > 0:
+        await asyncio.sleep(wait)
+    self._last = time.monotonic()      # <- wrong
+```
+
+Stamping at admission measures **start-to-start**. The provider measures
+**finish-to-start** — the idle between its last response finishing and your next
+request arriving. Subtract the provider's own latency and the gap silently
+collapses:
+
+```
+configured gap 2.8s, upstream latency 2.5s
+  -> real idle delivered = 0.3s     (inside the rejection band)
+```
+
+A bench test with a mock upstream hides this completely, because the mock answers
+in microseconds. Only real latency exposes it. Stamp on **release**:
+
+```python
+def release(self, model=""):
+    self._last = time.monotonic()      # response finished: window starts here
+```
+
+And note the consequence that follows from it: **a tier with a minimum idle gap
+cannot serve concurrent requests.** A second request admitted while the first is
+in flight collapses the idle window to zero however you stamp the clock. The free
+tier therefore serializes; metered tiers, which have no window, keep full
+concurrency.
+
+### Measuring it without fooling yourself
+
+Record the interval between request *starts*, then subtract the previous call's
+latency to get idle. Plot outcomes against derived idle — never against the gap
+you asked for. A sweep that looks self-contradictory under start-to-start
+resolves cleanly under idle.
+
+If identical idle values alternate pass/fail across repeats, that is a **token
+bucket refilling**, not a broken test. Set the gap above the first unambiguously
+clean value; a lone clean result just below the noisy band is luck.
+
+Finally: the provider's own error text is a hypothesis, not a spec. LiteRouter's
+body says *"5 seconds between messages."* Measured, the real boundary was ~1.5s
+of idle with clear margin only from 2.5s.
 
 ## The bug worth knowing about
 
@@ -183,7 +236,7 @@ Smallest clean gap: 0.6s
 Recommended PACE_FREE_GAP=0.9  (cliff + margin)
 ```
 
-Set `PACE_FREE_GAP` to the recommended value. The shipped default is `2.8`,
+Set `PACE_FREE_GAP` to the recommended value. The shipped default is `2.5`,
 which is what the free tier this was built against needed — yours will differ,
 which is exactly why the script exists.
 
@@ -195,7 +248,7 @@ Everything is an environment variable; `.env.example` is annotated.
 |---|---|---|
 | `PACE_UPSTREAM` | `https://api.openai.com/v1` | the real API base URL |
 | `PACE_API_KEY` | `$OPENAI_API_KEY` | credential sent upstream |
-| `PACE_FREE_GAP` | `2.8` | seconds between throttled-tier requests |
+| `PACE_FREE_GAP` | `2.5` | idle seconds between throttled-tier requests |
 | `PACE_PAID_GAP` | `0` | seconds between metered requests |
 | `PACE_MAX_CONCURRENT` | `4` | provider cap, minus headroom |
 | `PACE_LADDER` | *(empty)* | comma-separated fallback order |
